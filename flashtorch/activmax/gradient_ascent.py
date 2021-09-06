@@ -42,11 +42,12 @@ class GradientAscent:
     # Public interface #
     ####################
 
-    def __init__(self, model, img_size=224, lr=1., use_gpu=False):
+    def __init__(self, model, in_channel=3, img_size=224, lr=1., use_gpu=False):
         self.model = model
         self._img_size = img_size
         self._lr = lr
         self._use_gpu = use_gpu
+        self.in_channel = in_channel
 
         self.num_layers = len(list(self.model.named_children()))
         self.activation = None
@@ -116,7 +117,11 @@ class GradientAscent:
 
         if torch.cuda.is_available() and self.use_gpu:
             self.model = self.model.to('cuda')
-            input_ = input_.to('cuda')
+            if isinstance(input_, torch.Tensor):
+                input_ = input_.to('cuda')
+        
+        if not isinstance(input_, (tuple, list)):
+            input_ = (input_, )
 
         # Remove previous hooks if any
 
@@ -129,16 +134,16 @@ class GradientAscent:
         self.handlers.append(self._register_backward_hooks())
 
         # Inisialize gradients
-
-        self.gradients = torch.zeros(input_.shape)
+        
+        self.gradients = torch.zeros(input_[0].shape, device=input_[0].device)
 
         # Optimize
 
-        return self._ascent(input_, num_iter)
+        return self._ascent(input_, num_iter, device=input_[0].device)
 
     def visualize(self, layer, filter_idxs=None, lr=1., num_iter=30,
                   num_subplots=4, figsize=(4, 4), title='Conv2d',
-                  return_output=False):
+                  return_output=False, dummy_input=None):
         """Optimizes for the target layer/filter and visualizes the output.
 
         A method that combines optimization and visualization. There are
@@ -183,6 +188,13 @@ class GradientAscent:
                     image is determined by `img_size` attribute which defaults
                     to 224.
 
+        usage:
+            import torch
+            dummy_input = torch.randn([1, 3, 224, 224]).cuda()
+            dummy_input.requires_grad = True
+            g_ascent = GradientAscent(model, use_gpu=True)
+            g_ascent.visualize(model.layer4[0].conv1, title='layer4', dummy_input=(dummy_input,))
+
         """
 
         self._lr = lr
@@ -192,7 +204,8 @@ class GradientAscent:
                                    filter_idxs,
                                    num_iter=num_iter,
                                    figsize=figsize,
-                                   title=title)
+                                   title=title,
+                                   dummy_input=dummy_input)
         else:
             num_total_filters = layer.out_channels
 
@@ -205,7 +218,8 @@ class GradientAscent:
                                     filter_idxs,
                                     num_iter,
                                     len(filter_idxs),
-                                    title=title)
+                                    title=title,
+                                    dummy_input=dummy_input)
 
         if return_output:
             return self.output
@@ -252,7 +266,7 @@ class GradientAscent:
         plt.title(title)
 
         plt.imshow(format_for_plotting(
-            standardize_and_clip(output[-1],
+            standardize_and_clip(output[-1][0],
                                  saturation=0.15,
                                  brightness=0.7))); # noqa
 
@@ -276,21 +290,22 @@ class GradientAscent:
 
         for _, module in self.model.named_modules():
             if isinstance(module, nn.modules.conv.Conv2d) and \
-                    module.in_channels == 3:
+                    module.in_channels == self.in_channel:
                 return module.register_backward_hook(_record_gradients)
 
-    def _ascent(self, x, num_iter):
+    def _ascent(self, x, num_iter, device='cuda'):
         output = []
 
         for i in range(num_iter):
-            self.model(x)
+            self.model(*x)
 
             self.activation.backward()
 
             self.gradients /= (torch.sqrt(torch.mean(
                 torch.mul(self.gradients, self.gradients))) + 1e-5)
+            self.gradients.to(device)
 
-            x = x + self.gradients * self._lr
+            x = [x_ + self.gradients * self._lr for x_ in x]
             output.append(x)
 
         return output
@@ -310,12 +325,12 @@ class GradientAscent:
         plt.title(title)
 
         plt.imshow(format_for_plotting(
-            standardize_and_clip(self.output[-1],
+            standardize_and_clip(self.output[-1][0],
                                  saturation=0.15,
                                  brightness=0.7))); # noqa
 
     def _visualize_filters(self, layer, filter_idxs, num_iter, num_subplots,
-                           title):
+                           title, dummy_input=None):
         # Prepare the main plot
 
         num_cols = 4
@@ -330,7 +345,7 @@ class GradientAscent:
         # Plot subplots
 
         for i, filter_idx in enumerate(filter_idxs):
-            output = self.optimize(layer, filter_idx, num_iter=num_iter)
+            output = self.optimize(layer, filter_idx, num_iter=num_iter, input_=dummy_input)
 
             self.output.append(output)
 
@@ -340,7 +355,7 @@ class GradientAscent:
             ax.set_title(f'filter {filter_idx}')
 
             ax.imshow(format_for_plotting(
-                standardize_and_clip(output[-1],
+                standardize_and_clip(output[-1][0],
                                      saturation=0.15,
                                      brightness=0.7)))
 
